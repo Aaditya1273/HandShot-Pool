@@ -268,6 +268,15 @@ class GestureGameController:
         # Count curled fingers (for more accurate click detection)
         curled_count = 5 - sum(finger_status)
         
+        # Calculate fingertip proximity for click detection
+        # Check if fingertips are close to palm (better click detection)
+        fingertips = [8, 12, 16, 20]  # Index, middle, ring, pinky tips
+        palm_center = landmarks[0]  # Use wrist as reference
+        
+        # Calculate average distance from fingertips to palm
+        fingertip_distances = [np.linalg.norm(landmarks[tip] - palm_center) for tip in fingertips]
+        avg_distance = np.mean(fingertip_distances)
+        
         # Prevent gesture flickering by requiring consistent gestures
         if len(self.gesture_history) >= 3:
             # If the last 3 gestures were the same, maintain that gesture
@@ -287,8 +296,8 @@ class GestureGameController:
             return 'pull'
         
         # Click gesture: closed fist or only thumb extended
-        # More strict requirement - at least 4 fingers must be curled
-        if curled_count >= 4:
+        # Now using both curled fingers AND fingertip proximity to palm
+        if (curled_count >= 3 and avg_distance < 0.1) or curled_count >= 4:
             return 'click'
         
         # Release gesture: open hand (most fingers extended) after click/pull
@@ -496,6 +505,8 @@ class GestureGameController:
         if self.show_debug and hasattr(self, 'last_frame'):
             cv2.putText(self.last_frame, f"Gesture: {stable_gesture}", (10, 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(self.last_frame, f"Mouse: {'DOWN' if self.is_aiming else 'UP'}", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         
         # Check for transition from click/pull to release (hit detection)
         hit_detected = (stable_gesture == 'release' and 
@@ -518,27 +529,43 @@ class GestureGameController:
         
         elif stable_gesture == 'click':
             # Click and hold to start aiming the cue
-            if not self.is_aiming and not self.power_adjustment and self.last_gesture != 'click':
+            if not self.is_aiming:
                 # Store current position before clicking
                 self.aim_start_pos = (current_x, current_y)
+                # Ensure mouse is down and stays down
                 pyautogui.mouseDown()
                 self.is_aiming = True
                 self.strike_cooldown = 5
+                
+                # Debug output for click
+                if self.show_debug and hasattr(self, 'last_frame'):
+                    cv2.putText(self.last_frame, "CLICK DETECTED!", 
+                              (self.last_frame.shape[1]//2-100, self.last_frame.shape[0]//2), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
         
         elif stable_gesture == 'pull':
             # Pull back to adjust power (drag while holding)
-            if self.is_aiming:
-                self.power_adjustment = True
+            # Make sure mouse is still down during pull
+            if not self.is_aiming:
+                pyautogui.mouseDown()
+                self.is_aiming = True
+            self.power_adjustment = True
         
         elif stable_gesture == 'release':
             # Release to strike the ball
-            if (self.is_aiming or self.power_adjustment) and self.last_gesture != 'release':
+            if self.is_aiming or self.power_adjustment:
                 # If we're transitioning from click/pull to release, this is a hit
                 # Keep the cursor position stable during the hit
                 if self.aim_start_pos:
                     # Optional: move back to original position for consistent hits
                     # pyautogui.moveTo(self.aim_start_pos[0], self.aim_start_pos[1])
                     pass
+                
+                # Debug output for release
+                if self.show_debug and hasattr(self, 'last_frame'):
+                    cv2.putText(self.last_frame, "RELEASE DETECTED!", 
+                              (self.last_frame.shape[1]//2-100, self.last_frame.shape[0]//2), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
                 
                 # Release the mouse button to execute the hit
                 pyautogui.mouseUp()
