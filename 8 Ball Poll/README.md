@@ -1,4 +1,4 @@
-# HandShot-Pool: Gesture-Controlled 8 Ball Billiards
+# HandShot-Pool: Gesture-Controlled 8 Ball Billiards:
 
 A computer vision-based 8 Ball Billiards game that allows players to control the game using hand gestures.
 
