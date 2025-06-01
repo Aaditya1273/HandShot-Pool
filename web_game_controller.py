@@ -265,24 +265,35 @@ class GestureGameController:
         pinky_mcp = landmarks[17, :2]
         hand_tilt = index_mcp[1] - pinky_mcp[1]  # Positive when index is lower than pinky
         
-        # Use gesture history for stability
-        if len(self.gesture_history) > 3:
-            from collections import Counter
-            most_common = Counter(self.gesture_history[-3:]).most_common(1)[0][0]
-            # If we have a consistent non-aim gesture, prioritize it
-            if most_common != 'aim' and most_common == self.gesture_history[-1]:
-                return most_common
+        # Count curled fingers (for more accurate click detection)
+        curled_count = 5 - sum(finger_status)
+        
+        # Prevent gesture flickering by requiring consistent gestures
+        if len(self.gesture_history) >= 3:
+            # If the last 3 gestures were the same, maintain that gesture
+            if len(set(self.gesture_history[-3:])) == 1 and self.gesture_history[-1] != 'aim':
+                # But still allow transitioning from click to release (for hitting)
+                if self.gesture_history[-1] == 'click' and sum(finger_status) >= 4:
+                    return 'release'
+                # And still allow transitioning from pull to release (for hitting)
+                if self.gesture_history[-1] == 'pull' and sum(finger_status) >= 4:
+                    return 'release'
+                # Otherwise maintain the stable gesture
+                return self.gesture_history[-1]
         
         # Detect pull gesture (hand tilted back)
-        if hand_tilt > 0.05 and sum(finger_status) <= 2:
+        # Increased threshold for more reliable detection
+        if hand_tilt > 0.07 and curled_count >= 3:
             return 'pull'
         
         # Click gesture: closed fist or only thumb extended
-        if sum(finger_status) <= 1:
+        # More strict requirement - at least 4 fingers must be curled
+        if curled_count >= 4:
             return 'click'
         
-        # Release gesture: open hand after click/pull
-        if sum(finger_status) >= 4:
+        # Release gesture: open hand (most fingers extended) after click/pull
+        # Reduced threshold to make release easier to trigger
+        if sum(finger_status) >= 3 and self.last_gesture in ['click', 'pull']:
             return 'release'
         
         # Default to aim gesture (for moving the cue)
@@ -373,7 +384,7 @@ class GestureGameController:
     
     def _get_finger_status(self, landmarks):
         """
-        Determine which fingers are extended or curled.
+        Determine which fingers are extended or curled with improved accuracy.
         
         Args:
             landmarks: Hand landmarks detected by MediaPipe
@@ -382,10 +393,9 @@ class GestureGameController:
             List of booleans indicating if each finger is extended [thumb, index, middle, ring, pinky]
         """
         # Get finger joint positions
-        # For each finger, we need the tip, pip (middle joint), and mcp (base joint)
         finger_status = [False] * 5  # Default all fingers to curled
         
-        # Thumb is special case - compare distance from tip to palm vs distance from base to palm
+        # Thumb is special case - use angle-based detection
         thumb_tip = landmarks[4]
         thumb_ip = landmarks[3]
         thumb_mcp = landmarks[2]
@@ -396,25 +406,37 @@ class GestureGameController:
         v1 = thumb_mcp - thumb_ip
         v2 = thumb_tip - thumb_ip
         angle = np.arccos(np.clip(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)), -1.0, 1.0))
-        finger_status[0] = angle > 2.0  # Thumb is extended if angle is large enough
+        finger_status[0] = angle > 1.7  # Reduced threshold to detect thumb extension more easily
         
-        # For other fingers, check if tip is extended beyond PIP joint
-        # Index finger
-        if landmarks[8, 1] < landmarks[6, 1]:  # Y-coordinate comparison (lower value is higher up)
-            finger_status[1] = True
+        # For other fingers, use both distance and angle for more accurate detection
+        # Define finger landmarks
+        fingertips = [8, 12, 16, 20]  # Index, middle, ring, pinky tips
+        pips = [6, 10, 14, 18]       # Second joints
+        mcps = [5, 9, 13, 17]        # Knuckles
+        
+        # Check each finger
+        for i, (tip, pip, mcp) in enumerate(zip(fingertips, pips, mcps)):
+            # Method 1: Height-based detection (traditional)
+            height_extended = landmarks[tip, 1] < landmarks[pip, 1]
             
-        # Middle finger
-        if landmarks[12, 1] < landmarks[10, 1]:
-            finger_status[2] = True
+            # Method 2: Angle-based detection (more accurate)
+            # Calculate angle at PIP joint
+            v1 = landmarks[mcp] - landmarks[pip]
+            v2 = landmarks[tip] - landmarks[pip]
+            angle = np.arccos(np.clip(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)), -1.0, 1.0))
+            angle_extended = angle > 2.0  # Finger is straight if angle is large
             
-        # Ring finger
-        if landmarks[16, 1] < landmarks[14, 1]:
-            finger_status[3] = True
+            # Method 3: Distance-based detection
+            # Compare distance from fingertip to wrist vs from knuckle to wrist
+            tip_to_wrist = np.linalg.norm(landmarks[tip] - landmarks[0])
+            mcp_to_wrist = np.linalg.norm(landmarks[mcp] - landmarks[0])
+            distance_ratio = tip_to_wrist / mcp_to_wrist
+            distance_extended = distance_ratio > 1.5
             
-        # Pinky finger
-        if landmarks[20, 1] < landmarks[18, 1]:
-            finger_status[4] = True
-            
+            # Combine methods - finger is extended if at least 2 methods agree
+            methods = [height_extended, angle_extended, distance_extended]
+            finger_status[i+1] = sum(methods) >= 2
+        
         return finger_status
     
     def control_game(self, gesture, normalized_position):
@@ -475,8 +497,16 @@ class GestureGameController:
             cv2.putText(self.last_frame, f"Gesture: {stable_gesture}", (10, 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
-        # Always move the cursor for better responsiveness, regardless of gesture
-        pyautogui.moveTo(smooth_x, smooth_y)
+        # Check for transition from click/pull to release (hit detection)
+        hit_detected = (stable_gesture == 'release' and 
+                      self.last_gesture in ['click', 'pull'] and 
+                      self.is_aiming)
+        
+        # Only move cursor if we're not in the middle of a hit action
+        # This prevents the cursor from moving down during the hit gesture
+        if not hit_detected:
+            # Move cursor for aiming
+            pyautogui.moveTo(smooth_x, smooth_y)
         
         # Handle pool game specific gestures
         if stable_gesture == 'aim':
@@ -489,9 +519,10 @@ class GestureGameController:
         elif stable_gesture == 'click':
             # Click and hold to start aiming the cue
             if not self.is_aiming and not self.power_adjustment and self.last_gesture != 'click':
+                # Store current position before clicking
+                self.aim_start_pos = (current_x, current_y)
                 pyautogui.mouseDown()
                 self.is_aiming = True
-                self.aim_start_pos = (smooth_x, smooth_y)
                 self.strike_cooldown = 5
         
         elif stable_gesture == 'pull':
@@ -502,6 +533,14 @@ class GestureGameController:
         elif stable_gesture == 'release':
             # Release to strike the ball
             if (self.is_aiming or self.power_adjustment) and self.last_gesture != 'release':
+                # If we're transitioning from click/pull to release, this is a hit
+                # Keep the cursor position stable during the hit
+                if self.aim_start_pos:
+                    # Optional: move back to original position for consistent hits
+                    # pyautogui.moveTo(self.aim_start_pos[0], self.aim_start_pos[1])
+                    pass
+                
+                # Release the mouse button to execute the hit
                 pyautogui.mouseUp()
                 self.is_aiming = False
                 self.power_adjustment = False
